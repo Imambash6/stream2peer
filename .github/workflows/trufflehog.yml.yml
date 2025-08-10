@@ -1,4 +1,4 @@
-# this is security scan for secrets 
+# Security scan for secrets using TruffleHog
 name: TruffleHog
 
 on:
@@ -14,26 +14,65 @@ permissions:
   pull-requests: write
 
 jobs:
-  TruffleHog:
+  trufflehog:
     runs-on: ubuntu-latest
     defaults:
       run:
         shell: bash
     steps:
+      # 1. Checkout the code
       - name: Checkout code
         uses: actions/checkout@v3
         with:
           fetch-depth: 0
 
+      # 2. Determine scan scope
+      - name: Set scan path
+        id: scan_path
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            CHANGED_FILES=$(git diff --name-only origin/${{ github.event.repository.default_branch }} HEAD | tr '\n' ' ')
+            echo "PATHS=$CHANGED_FILES" >> $GITHUB_ENV
+          else
+            echo "PATHS=./" >> $GITHUB_ENV
+          fi
+
+      # 3. Run TruffleHog scan
       - name: TruffleHog OSS
         id: trufflehog
-        uses: trufflesecurity/trufflehog@main
-        with:
-          path: ./
-          base: "${{ github.event.repository.default_branch }}"
-          head: HEAD
-          extra_args: --debug
+        run: |
+          trufflesecurity/trufflehog@main \
+            --path "${{ env.PATHS }}" \
+            --base "${{ github.event.repository.default_branch }}" \
+            --head HEAD \
+            --json --debug > trufflehog.json
 
-      - name: Scan Results Status
-        if: steps.trufflehog.outcome == 'failure'
-        run: exit 1
+      # 4. Post results to PR (only runs for pull requests)
+      - name: Post results to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const results = fs.readFileSync('trufflehog.json', 'utf8').trim();
+            const body = results.length > 0 
+              ? `🔍 **TruffleHog scan results:**\n\`\`\`json\n${results}\n\`\`\``
+              : '✅ No secrets found by TruffleHog.';
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
+
+      # 5. Fail the build if secrets were found
+      - name: Fail if secrets found
+        run: |
+          if [ -s trufflehog.json ]; then
+            echo "❌ Secrets found!"
+            cat trufflehog.json
+            exit 1
+          else
+            echo "✅ No secrets found."
+          fi
